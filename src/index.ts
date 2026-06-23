@@ -2,28 +2,90 @@
  * Servidor Hono — Wapi Agent Bot (agente de ventas de wapi.mx) sobre Chatwoot.
  *
  * Flujo:
- *   POST /webhook → filtro anti-bucle → ACK 200 → procesa async (setImmediate)
- *   Antes de llamar al agente se lee el historial de la conversación para
- *   darle contexto multi-turno al LLM.
+ *   POST /webhook → filtro anti-bucle → ACK 200 → encola por conversación
+ *   Antes de llamar al agente se recupera el historial de la conversación
+ *   (en memoria) para darle contexto multi-turno al LLM.
  *
- * No usa cola (BullMQ/Redis): para el volumen del demo, setImmediate basta.
+ * No usa cola externa (BullMQ/Redis): basta una cadena de promesas por
+ * conversación para procesar los mensajes en orden (ver `enqueue`).
  */
 
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import {
-  mapChatwootMessages,
-  runAgent,
-  type ConversationMessage,
-} from "./agent.js";
-import { getConversationMessages, sendMessage } from "./chatwoot.js";
+import { runAgent, type ConversationMessage } from "./agent.js";
+import { sendMessage } from "./chatwoot.js";
 
 const app = new Hono();
 
 /** Delay entre mensajes cuando dividimos con |||. */
 const MESSAGE_DELAY_MS = 800;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Historial de conversación en memoria, por conversationId.
+ *
+ * El token de Chatwoot es de un Agent Bot, y los Agent Bots NO pueden leer
+ * mensajes vía la API (responde "not authorized for bots"). Por eso mantenemos
+ * el historial nosotros: el bot ve cada mensaje entrante y genera cada
+ * respuesta, así que puede reconstruir el hilo completo sin leer la API.
+ *
+ * Nota: es en memoria — se pierde si el proceso se reinicia. Para historial
+ * persistente se necesitaría un Access Token de usuario (no de bot) y leer los
+ * mensajes desde la API, o una base de datos.
+ */
+const conversationHistories = new Map<string, ConversationMessage[]>();
+const MAX_HISTORY = 20;
+
+function getHistory(conversationId: string | number): ConversationMessage[] {
+  return conversationHistories.get(String(conversationId)) ?? [];
+}
+
+function appendHistory(
+  conversationId: string | number,
+  ...messages: ConversationMessage[]
+): void {
+  const key = String(conversationId);
+  const arr = conversationHistories.get(key) ?? [];
+  arr.push(...messages);
+  if (arr.length > MAX_HISTORY) {
+    arr.splice(0, arr.length - MAX_HISTORY);
+  }
+  conversationHistories.set(key, arr);
+}
+
+/**
+ * Cola secuencial por conversación.
+ *
+ * En WhatsApp es común que el cliente mande varios mensajes seguidos. Cada uno
+ * llega como un webhook distinto, así que sin esto se procesarían en paralelo,
+ * todos leerían el MISMO historial viejo y el bot se contradiría (p. ej. saluda
+ * dos veces). Encadenamos el procesamiento por conversationId para que cada
+ * mensaje vea el resultado del anterior. Conversaciones distintas siguen en
+ * paralelo.
+ */
+const processingChains = new Map<string, Promise<unknown>>();
+
+export function enqueue(
+  conversationId: string | number,
+  task: () => Promise<void>,
+): void {
+  const key = String(conversationId);
+  const prev = processingChains.get(key) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {}) // un error en el turno previo no debe romper la cadena
+    .then(task)
+    .catch((err) => {
+      console.error("[queue] error procesando mensaje:", err);
+    });
+  processingChains.set(key, next);
+  // Limpieza: si nadie encoló después, liberamos la entrada del Map.
+  void next.finally(() => {
+    if (processingChains.get(key) === next) {
+      processingChains.delete(key);
+    }
+  });
+}
 
 /** Forma (parcial) del payload del Agent Bot de Chatwoot que nos importa. */
 interface ChatwootWebhookPayload {
@@ -67,11 +129,11 @@ app.post("/webhook", async (c) => {
   }
 
   // Paso 2 — ACK inmediato (200) antes de tocar el LLM.
-  // Paso 3 — Procesamos en segundo plano.
+  // Paso 3 — Procesamos en segundo plano, en orden por conversación.
   setImmediate(() => {
-    processMessage(payload).catch((err) => {
-      console.error("[webhook] error procesando mensaje:", err);
-    });
+    enqueue(payload.conversation?.id ?? "sin-id", () =>
+      processMessage(payload),
+    );
   });
 
   return c.body(null, 200);
@@ -94,28 +156,25 @@ async function processMessage(
     return;
   }
   if (!messageText.trim()) {
-    console.warn("[processMessage] mensaje vacío, se ignora");
+    // Mensaje entrante sin texto: casi siempre es un audio, imagen o sticker.
+    // No lo ignoramos en silencio (se vería como que el bot no contesta):
+    // pedimos amablemente que lo escriban.
+    console.log("[processMessage] mensaje sin texto (adjunto), pido texto");
+    await sendMessage(
+      conversationId,
+      "Por ahora solo puedo leer mensajes de texto 🙏 ¿Me lo escribes y con gusto te ayudo?",
+    ).catch((err) =>
+      console.error("[processMessage] no pude pedir texto:", err),
+    );
     return;
   }
 
-  console.log(
-    `[processMessage] conv=${conversationId} msg="${messageText}"`,
-  );
+  // Historial previo (no incluye el mensaje actual; runAgent lo añade).
+  const history = getHistory(conversationId);
 
-  // Historial de la conversación (best-effort) para contexto multi-turno.
-  let history: ConversationMessage[] = [];
-  try {
-    const raw = await getConversationMessages(conversationId);
-    history = mapChatwootMessages(raw);
-    // El mensaje entrante actual ya está persistido en Chatwoot, así que viene
-    // como último elemento. Lo quitamos: runAgent vuelve a añadirlo como el
-    // último mensaje (role: user).
-    if (history.length && history[history.length - 1].role === "user") {
-      history = history.slice(0, -1);
-    }
-  } catch (err) {
-    console.error("[processMessage] no se pudo leer el historial:", err);
-  }
+  console.log(
+    `[processMessage] conv=${conversationId} histLen=${history.length} msg="${messageText}"`,
+  );
 
   let result;
   try {
@@ -134,8 +193,13 @@ async function processMessage(
   }
 
   // Si transfirió con Juan, runAgent ya envió el mensaje con el link y asignó
-  // la conversación. No mandamos nada más.
+  // la conversación. Guardamos el turno y salimos.
   if (result.shouldTransfer) {
+    appendHistory(
+      conversationId,
+      { role: "user", content: messageText },
+      { role: "assistant", content: result.text },
+    );
     return;
   }
 
@@ -145,12 +209,36 @@ async function processMessage(
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
 
+  // Salvaguarda: si el modelo no devolvió texto, no dejamos al cliente sin
+  // respuesta. Mandamos un mensaje puente y guardamos el turno.
+  if (parts.length === 0) {
+    const fallback =
+      "Perdona, se me cruzaron los cables 🙈 ¿Me lo repites? Quiero entenderte bien para ayudarte con Wapi.";
+    await sendMessage(conversationId, fallback).catch((err) =>
+      console.error("[processMessage] fallback falló:", err),
+    );
+    appendHistory(
+      conversationId,
+      { role: "user", content: messageText },
+      { role: "assistant", content: fallback },
+    );
+    return;
+  }
+
   for (let i = 0; i < parts.length; i++) {
     await sendMessage(conversationId, parts[i]);
     if (i < parts.length - 1) {
       await sleep(MESSAGE_DELAY_MS);
     }
   }
+
+  // Persistimos el turno completo (mensaje del cliente + respuesta del agente)
+  // para tener contexto en el siguiente mensaje.
+  appendHistory(
+    conversationId,
+    { role: "user", content: messageText },
+    { role: "assistant", content: parts.join("\n") || result.text },
+  );
 }
 
 // Solo arrancamos el servidor cuando se ejecuta de verdad, no al importar el

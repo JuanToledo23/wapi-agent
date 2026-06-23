@@ -297,7 +297,13 @@ export async function runAgent(args: RunAgentArgs): Promise<AgentResult> {
 
   if (transferred) {
     await sendMessage(conversationId, TRANSFER_MESSAGE);
-    await assignToHuman(conversationId);
+    try {
+      await assignToHuman(conversationId);
+    } catch (err) {
+      // El cliente ya recibió el link de Juan; si la asignación en Chatwoot
+      // falla, no le mostramos un error. Lo registramos para revisarlo.
+      console.error("[runAgent] assignToHuman falló tras transferir:", err);
+    }
     return { text, shouldTransfer: true };
   }
 
