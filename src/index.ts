@@ -1,8 +1,10 @@
 /**
- * Servidor Hono — Chatwoot Agent Bot para la Notaría Pública 192.
+ * Servidor Hono — Wapi Agent Bot (agente de ventas de wapi.mx) sobre Chatwoot.
  *
  * Flujo:
- *   POST /webhook  → filtro anti-bucle → ACK 200 → procesa async (setImmediate)
+ *   POST /webhook → filtro anti-bucle → ACK 200 → procesa async (setImmediate)
+ *   Antes de llamar al agente se lee el historial de la conversación para
+ *   darle contexto multi-turno al LLM.
  *
  * No usa cola (BullMQ/Redis): para el volumen del demo, setImmediate basta.
  */
@@ -10,14 +12,16 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { runAgent } from "./agent.js";
-import { assignToHuman, sendMessage } from "./chatwoot.js";
+import {
+  mapChatwootMessages,
+  runAgent,
+  type ConversationMessage,
+} from "./agent.js";
+import { getConversationMessages, sendMessage } from "./chatwoot.js";
 
 const app = new Hono();
 
-const ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID ?? "";
-
-/** Delay entre mensajes cuando dividimos con ||| (patrón de meta-api.ts). */
+/** Delay entre mensajes cuando dividimos con |||. */
 const MESSAGE_DELAY_MS = 800;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -26,14 +30,27 @@ interface ChatwootWebhookPayload {
   message_type?: string;
   private?: boolean;
   content?: string;
-  sender?: { phone_number?: string };
   conversation?: {
     id?: number | string;
     meta?: { assignee?: unknown };
   };
 }
 
-app.get("/", (c) => c.text("Chatwoot Agent Bot — Notaría 192 ✅"));
+/**
+ * Filtro anti-bucle. True si el evento debe ignorarse en silencio.
+ * Solo procesamos mensajes entrantes y públicos; cualquier otra cosa
+ * (mensajes salientes del propio bot, notas privadas, eventos de actividad,
+ * payloads malformados) se descarta para no entrar en bucle.
+ */
+export function shouldIgnoreWebhookEvent(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return true;
+  const p = payload as { message_type?: unknown; private?: unknown };
+  if (p.message_type !== "incoming") return true;
+  if (p.private === true) return true;
+  return false;
+}
+
+app.get("/", (c) => c.text("Wapi Agent Bot — wapi.mx ✅"));
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.post("/webhook", async (c) => {
@@ -45,17 +62,11 @@ app.post("/webhook", async (c) => {
   }
 
   // Paso 1 — Filtro anti-bucle (lo PRIMERO de todo).
-  // Solo procesamos mensajes entrantes y públicos; cualquier otra cosa
-  // (mensajes salientes del propio bot, notas privadas, eventos) la
-  // ignoramos para no entrar en bucle.
-  if (payload.message_type !== "incoming") {
-    return c.body(null, 200);
-  }
-  if (payload.private === true) {
+  if (shouldIgnoreWebhookEvent(payload)) {
     return c.body(null, 200);
   }
 
-  // Paso 2 — ACK inmediato: respondemos 200 antes de tocar el LLM.
+  // Paso 2 — ACK inmediato (200) antes de tocar el LLM.
   // Paso 3 — Procesamos en segundo plano.
   setImmediate(() => {
     processMessage(payload).catch((err) => {
@@ -69,15 +80,12 @@ app.post("/webhook", async (c) => {
 async function processMessage(
   payload: ChatwootWebhookPayload,
 ): Promise<void> {
-  // Si ya hay un agente humano asignado, el bot calla. En cuanto la
-  // conversación se asigna a un humano, dejamos de responder en todos
-  // los mensajes siguientes.
+  // Si ya hay un agente humano asignado, el bot calla.
   if (payload.conversation?.meta?.assignee) {
     console.log("[processMessage] humano asignado, el bot no responde");
     return;
   }
 
-  const userPhone = payload.sender?.phone_number ?? "";
   const messageText = payload.content ?? "";
   const conversationId = payload.conversation?.id;
 
@@ -91,26 +99,43 @@ async function processMessage(
   }
 
   console.log(
-    `[processMessage] conv=${conversationId} phone=${userPhone} msg="${messageText}"`,
+    `[processMessage] conv=${conversationId} msg="${messageText}"`,
   );
+
+  // Historial de la conversación (best-effort) para contexto multi-turno.
+  let history: ConversationMessage[] = [];
+  try {
+    const raw = await getConversationMessages(conversationId);
+    history = mapChatwootMessages(raw);
+    // El mensaje entrante actual ya está persistido en Chatwoot, así que viene
+    // como último elemento. Lo quitamos: runAgent vuelve a añadirlo como el
+    // último mensaje (role: user).
+    if (history.length && history[history.length - 1].role === "user") {
+      history = history.slice(0, -1);
+    }
+  } catch (err) {
+    console.error("[processMessage] no se pudo leer el historial:", err);
+  }
 
   let result;
   try {
-    result = await runAgent(userPhone, messageText);
+    result = await runAgent({
+      conversationId,
+      message: messageText,
+      history,
+    });
   } catch (err) {
     console.error("[processMessage] runAgent falló:", err);
     await sendMessage(
-      ACCOUNT_ID,
       conversationId,
-      "Disculpe, tuvimos un problema técnico. Por favor intente de nuevo en un momento.",
+      "Disculpa, tuvimos un problema técnico. Por favor intenta de nuevo en un momento.",
     ).catch(() => {});
     return;
   }
 
-  // Si el agente decidió transferir → asignar a humano (esto ya envía
-  // su propio mensaje de transferencia al cliente).
+  // Si transfirió con Juan, runAgent ya envió el mensaje con el link y asignó
+  // la conversación. No mandamos nada más.
   if (result.shouldTransfer) {
-    await assignToHuman(ACCOUNT_ID, conversationId);
     return;
   }
 
@@ -121,17 +146,21 @@ async function processMessage(
     .filter((p) => p.length > 0);
 
   for (let i = 0; i < parts.length; i++) {
-    await sendMessage(ACCOUNT_ID, conversationId, parts[i]);
+    await sendMessage(conversationId, parts[i]);
     if (i < parts.length - 1) {
       await sleep(MESSAGE_DELAY_MS);
     }
   }
 }
 
-const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(
-    `🚀 Chatwoot Agent Bot (Notaría 192) escuchando en http://localhost:${info.port}`,
-  );
-  console.log(`   Webhook: POST http://localhost:${info.port}/webhook`);
-});
+// Solo arrancamos el servidor cuando se ejecuta de verdad, no al importar el
+// módulo desde los tests (Vitest define process.env.VITEST).
+if (!process.env.VITEST) {
+  const port = Number(process.env.PORT ?? 3000);
+  serve({ fetch: app.fetch, port }, (info) => {
+    console.log(
+      `🚀 Wapi Agent Bot escuchando en http://localhost:${info.port}`,
+    );
+    console.log(`   Webhook: POST http://localhost:${info.port}/webhook`);
+  });
+}

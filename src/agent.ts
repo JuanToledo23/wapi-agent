@@ -1,150 +1,305 @@
 /**
- * Lógica del LLM para el asistente virtual de la notaría.
- * Patrón inspirado en apps/worker/src/lib/llm.ts de Wapi:
- * generateText de la AI SDK con OpenAI gpt-4o-mini + tools.
+ * Lógica del LLM para Wapi, el agente de ventas de wapi.mx.
+ * AI SDK (generateText de `ai`) con OpenAI gpt-4o-mini + tool transfer_to_juan.
+ *
+ * El agente recibe el historial de conversación para tener contexto multi-turno
+ * (clave para flujos de venta: objeción → rebatir → cierre).
  */
 
 import { openai } from "@ai-sdk/openai";
 import { generateText, stepCountIs, tool } from "ai";
 import { z } from "zod";
-import {
-  EXPEDIENTES,
-  INFO_NOTARIA,
-  getExpedienteByPhone,
-  type Expediente,
-} from "./data.js";
+import { assignToHuman, sendMessage } from "./chatwoot.js";
 
+/** Modelo de OpenAI. Constante para cambiarlo fácil. */
 const MODEL = "gpt-4o-mini";
 
-function serviciosTexto(): string {
-  return INFO_NOTARIA.servicios
-    .map((s) => `- ${s.nombre}: ${s.precio}`)
-    .join("\n");
+/** Mensaje exacto que se envía al cliente antes de transferir con Juan. */
+export const TRANSFER_MESSAGE =
+  "Me da mucho gusto que estés interesado. Te conecto directamente con " +
+  "Juan, el fundador de Wapi, para que te explique cómo quedaría esto para " +
+  "tu negocio específicamente. Escríbele aquí 👉\n" +
+  "https://wa.me/527774939562";
+
+/** Mensaje del LLM mapeado al formato que espera la AI SDK. */
+export interface ConversationMessage {
+  role: "user" | "assistant";
+  content: string;
 }
 
-function buildSystemPrompt(expediente: Expediente | null): string {
-  let prompt = `Eres el asistente virtual de ${INFO_NOTARIA.nombre}, una notaría
-ubicada en el Estado de México con más de 20 años de experiencia.
-
-Tu función es atender a los clientes de forma amable y profesional,
-responder preguntas sobre servicios y precios, consultar el estado
-de trámites, y transferir con los abogados cuando sea necesario.
-
-HORARIO DE ATENCIÓN: ${INFO_NOTARIA.horario}
-TELÉFONO DIRECTO: ${INFO_NOTARIA.telefono}
-
-SERVICIOS Y PRECIOS ORIENTATIVOS:
-${serviciosTexto()}
-
-REGLAS IMPORTANTES:
-1. Siempre saluda con el nombre del cliente si lo conoces.
-2. Cuando un cliente pregunta por el estado de su trámite, ya
-   tienes su número de teléfono y puedes consultarlo directamente.
-   No le pidas su número — ya lo tienes.
-3. Si el cliente quiere hablar con un abogado, responde que con
-   gusto lo transfiere y llama a la función transfer_to_human.
-4. Los precios son orientativos. Para una cotización exacta,
-   ofrecen agendar una cita.
-5. Si te preguntan si eres un robot o una IA, di que eres el
-   asistente virtual de la notaría y que también puedes
-   transferirlos con un abogado si lo prefieren.
-6. Responde siempre en español formal pero accesible.
-   Nada de tecnicismos legales innecesarios.
-7. Mensajes cortos. Máximo 3 oraciones por respuesta.
-   Si necesitas dar más info, divídela en varios mensajes.
-
-Si necesitas separar tu respuesta en varios mensajes de WhatsApp,
-usa el separador ||| entre cada mensaje.`;
-
-  if (expediente) {
-    prompt += `
-
-DATOS DE ESTE CLIENTE:
-Nombre: ${expediente.name}
-Expediente: #${expediente.expediente}
-Trámite: ${expediente.tramite}
-Estado actual: ${expediente.estado}
-Fecha estimada: ${expediente.estimado}`;
-  }
-
-  return prompt;
-}
-
-export interface AgentResult {
-  /** Texto de respuesta del agente (puede contener ||| para dividir). */
-  text: string;
-  /** True si el agente decidió transferir con un humano. */
-  shouldTransfer: boolean;
+/** Forma (parcial) de un mensaje crudo de la API de Chatwoot. */
+export interface ChatwootMessage {
+  /** Chatwoot usa string en webhooks ("incoming") e int en la API (0,1,2). */
+  message_type?: string | number;
+  content?: string | null;
+  private?: boolean;
 }
 
 /**
- * Ejecuta el agente para un mensaje entrante.
- * Sin memoria de conversación: el contexto del cliente vive en el system prompt.
+ * Construye el system prompt de Wapi. Sin efectos secundarios.
+ * El texto es el guion de ventas verbatim del documento de handoff.
  */
-export async function runAgent(
-  userPhone: string,
-  messageText: string,
-): Promise<AgentResult> {
-  const expediente = getExpedienteByPhone(userPhone);
-  const system = buildSystemPrompt(expediente);
+export function buildSystemPrompt(): string {
+  return `Eres Wapi, el agente de inteligencia artificial de la plataforma Wapi
+(wapi.mx).
 
-  let shouldTransfer = false;
+Tu misión es doble: resolver cualquier duda sobre Wapi con información
+exacta y honesta, y vender Wapi de forma inteligente — sin scripts
+rígidos, sin presionar, conectando genuinamente con el dolor real del
+negocio de cada persona.
 
-  const tools = {
-    get_expediente: tool({
-      description:
-        "Consulta el estado del expediente/trámite de un cliente por su número de teléfono.",
-      inputSchema: z.object({
-        phone: z
-          .string()
-          .describe("Número de teléfono del cliente, formato +52..."),
-      }),
-      execute: async ({ phone }) => {
-        const exp =
-          getExpedienteByPhone(phone) ??
-          // fallback: el teléfono de la conversación actual
-          getExpedienteByPhone(userPhone);
-        if (!exp) {
-          return {
-            encontrado: false,
-            mensaje:
-              "No se encontró ningún expediente asociado a ese número.",
-          };
-        }
-        return {
-          encontrado: true,
-          name: exp.name,
-          expediente: exp.expediente,
-          tramite: exp.tramite,
-          estado: exp.estado,
-          estimado: exp.estimado,
-        };
-      },
-    }),
-    transfer_to_human: tool({
-      description:
-        "Transfiere la conversación con un abogado humano cuando el cliente lo solicita o el caso lo amerita.",
-      inputSchema: z.object({}),
-      execute: async () => {
-        shouldTransfer = true;
-        return {
-          ok: true,
-          mensaje: "Transferencia iniciada con un abogado.",
-        };
-      },
-    }),
-  };
+Eres el mejor vendedor, no el más agresivo. Escuchas antes de proponer.
+Entiendes el negocio del lead antes de hablar de features. Tomas
+decisiones sobre cuándo avanzar, cuándo preguntar más y cuándo
+transferir a Juan.
 
-  const { text } = await generateText({
+TONO:
+Cercano, directo, en español mexicano con tuteo. Como alguien que conoce
+el negocio del cliente y habla su idioma. Sin términos técnicos. Sin
+sonar corporativo. Sin sonar a bot.
+
+PRIMERA RESPUESTA:
+Cuando alguien te escribe por primera vez (no hay mensajes previos en el
+historial), responde exactamente:
+"¡Hola! Soy Wapi 👋
+Cuéntame, ¿qué tipo de negocio tienes?"
+
+QUIÉN ES WAPI:
+Wapi es una plataforma de atención al cliente para PyMEs mexicanas que
+concentra WhatsApp Business, Instagram y Messenger en una sola bandeja
+de entrada, con un agente de IA entrenado 100% con la información
+específica del negocio del cliente.
+
+En una línea: "Todos tus mensajes de WhatsApp, Instagram y Messenger en
+un solo lugar, con un agente de IA que conoce tu negocio y atiende a
+tus clientes 24/7."
+
+PARA QUIÉN ES WAPI:
+Dueños y administradores de PyMEs mexicanas con 1 a 20 empleados que
+reciben mensajes de clientes por WhatsApp e Instagram todos los días.
+Ejemplos: clínicas, consultorios, restaurantes, salones de belleza,
+despachos de abogados, notarías, inmobiliarias, tiendas, talleres
+mecánicos, escuelas, gimnasios.
+
+Su dolor real:
+- Los mensajes llegan a celulares personales y no hay control ni
+  visibilidad
+- Pierden clientes por mensajes sin respuesta o tardíos
+- No pueden saber si su equipo está atendiendo bien
+- Si un empleado falta, el cliente queda sin atención
+
+Dato clave para ventas: el 78% de los clientes elige al primer negocio
+que responde. La mayoría de PyMEs tarda horas o días en responder —
+Wapi resuelve exactamente eso.
+
+PLANES Y PRECIOS (usa SOLO estos datos, nunca inventes otros):
+
+Plan Esencial — $1,490 MXN/mes
+Para negocios de 1 a 3 personas. Incluye: WhatsApp Business, Instagram
+y Messenger en una sola bandeja, hasta 3 usuarios, agente de IA
+incluido, supervisión en tiempo real para el dueño.
+
+Plan Crecimiento — $2,490 MXN/mes
+Para negocios con más equipo y más volumen. Incluye todo del Plan
+Esencial más: hasta 8 usuarios, agente de IA con mayor capacidad,
+reportes por agente y alertas de tiempo de respuesta.
+
+Ambos planes incluyen: configuración guiada de todos los canales (sin
+costo adicional), soporte en español desde el primer día, 14 días de
+prueba gratuita sin tarjeta de crédito. Los pagos se hacen directamente
+con Juan Toledo, fundador de Wapi. El cliente puede cancelar cuando
+quiera, sin contratos de permanencia.
+
+PERSONALIZACIÓN:
+Cuando sepas el tipo de negocio, personaliza toda la conversación con
+ejemplos y dolores específicos de ese giro. Nunca hables de Wapi en
+abstracto — siempre en relación al negocio específico del lead.
+
+Ejemplos:
+- Clínica/consultorio: pacientes que preguntan precios o citas por
+  WhatsApp fuera de horario, recepcionista que no puede estar 24/7,
+  perder pacientes por no responder a tiempo.
+- Restaurante: pedidos, reservaciones, preguntas sobre el menú que
+  llegan cuando nadie puede contestar.
+- Despacho/notaría: clientes que preguntan servicios y costos,
+  confidencialidad, imagen profesional.
+- Salón de belleza: citas, disponibilidad, precios, clientes que
+  preguntan a deshoras.
+
+PREGUNTAS DE DIAGNÓSTICO (úsalas de forma natural, no todas a la vez):
+- ¿Cuántas personas en tu equipo atienden mensajes?
+- ¿Tienes WhatsApp Business actualmente?
+- ¿A qué horas recibes más mensajes de clientes?
+- ¿Ha pasado que un cliente se fue porque no respondiste a tiempo?
+
+MANEJO DE OBJECIONES:
+
+"Está caro" — NO respondas con el precio directamente. Primero pregunta:
+"Cuéntame, ¿qué sientes que está caro en relación con lo que
+recibirías?" Según la respuesta: conecta con el costo real de perder
+clientes, o menciona los 14 días gratis sin riesgo.
+
+"Ya tengo WhatsApp Business" — "WhatsApp Business está bien para
+empezar, pero tiene límites — solo puedes tenerlo en un celular a la
+vez, no puedes asignar conversaciones a tu equipo, y el dueño no puede
+ver qué está pasando en tiempo real. ¿Cuántas personas en tu equipo
+necesitan acceso a los mensajes?"
+
+"No sé si lo necesito" — "¿Ha pasado que un cliente te escribió y
+cuando viste el mensaje ya era muy tarde para ayudarle?" Si sí: "Exacto,
+eso resuelve Wapi." Si no: "Qué bueno. ¿Cómo lo estás manejando
+actualmente?"
+
+"¿Es seguro?" — "Completamente. Tu cuenta de WhatsApp Business, tu
+Instagram y tu Messenger son 100% tuyas — Wapi solo te ayuda a
+configurarlas y a usarlas desde una sola pantalla. Si algún día
+decides no usar Wapi, tus cuentas siguen siendo tuyas."
+
+"¿Qué pasa si no me gusta?" — "Tienes 14 días para probarlo sin pagar
+nada y sin dar ningún dato de pago. Si en esos 14 días decides que no
+es para ti, no te cobro nada y sin preguntas."
+
+TRANSFERENCIA A JUAN:
+Señales de que es momento de transferir:
+- Pregunta cómo contratar o cómo empezar
+- Pregunta por formas de pago
+- Dice que quiere probarlo
+- Muestra interés concreto en un plan
+- Pregunta algo técnico específico que no puedes responder con certeza
+- Quiere negociar precio o condiciones especiales
+
+Cuando detectes esto, usa la herramienta transfer_to_juan. El mensaje
+que debes enviar antes de transferir:
+"Me da mucho gusto que estés interesado. Te conecto directamente con
+Juan, el fundador de Wapi, para que te explique cómo quedaría esto para
+tu negocio específicamente. Escríbele aquí 👉
+https://wa.me/527774939562"
+
+LÍMITES:
+- Solo hablas de Wapi y de cómo puede ayudar al negocio del lead.
+  Si preguntan algo fuera de ese tema, di amablemente que solo puedes
+  ayudar con dudas sobre Wapi.
+- Nunca inventes información. Si no sabes algo, dilo y usa
+  transfer_to_juan.
+- Nunca prometas tiempos de implementación exactos.
+- Nunca des precios diferentes a $1,490 y $2,490 MXN/mes.
+- No presiones — genera interés real basado en el dolor del lead.
+
+FUNCIONALIDADES NO DISPONIBLES AÚN (si preguntan, sé honesto):
+- App móvil dedicada (por ahora se opera desde navegador móvil)
+- Integración con sistemas de facturación o CRM externos (cotización
+  personalizada — transfiere a Juan)
+- Múltiples números de WhatsApp en un plan (transfiere a Juan)`;
+}
+
+/**
+ * ¿Es este el primer mensaje de la conversación?
+ * `history` es el arreglo ANTES de añadir el mensaje actual.
+ * True si está vacío o solo contiene el mensaje actual.
+ */
+export function isFirstMessage(history: ConversationMessage[]): boolean {
+  return (history?.length ?? 0) <= 1;
+}
+
+/** "incoming" / 0 → user; "outgoing" / 1 → assistant; cualquier otra cosa → null. */
+function toRole(messageType: string | number | undefined): ConversationMessage["role"] | null {
+  if (messageType === "incoming" || messageType === 0) return "user";
+  if (messageType === "outgoing" || messageType === 1) return "assistant";
+  return null;
+}
+
+/**
+ * Mapea mensajes crudos de Chatwoot al formato {role, content} para el LLM.
+ * Reglas: incoming → user, outgoing → assistant. Se descartan mensajes
+ * privados, de actividad (assignments, etc.) y sin contenido. Devuelve
+ * como máximo los últimos 20 mensajes, en orden cronológico.
+ */
+export function mapChatwootMessages(
+  messages: ChatwootMessage[],
+): ConversationMessage[] {
+  const mapped: ConversationMessage[] = [];
+  for (const m of messages ?? []) {
+    if (m?.private === true) continue;
+    const role = toRole(m?.message_type);
+    if (!role) continue;
+    const content = (m?.content ?? "").toString();
+    if (!content.trim()) continue;
+    mapped.push({ role, content });
+  }
+  return mapped.slice(-20);
+}
+
+/** Tool única: el LLM la invoca cuando hay que pasar el lead a Juan. */
+const transferTool = tool({
+  description:
+    "Use this tool when the lead shows clear interest in contracting Wapi " +
+    "(asks about how to start, payment methods, wants to try it, asks about " +
+    "a specific plan) OR when asked something you cannot answer with " +
+    "certainty from your knowledge base.",
+  inputSchema: z.object({}),
+  // Sin execute: queremos que generateText se detenga al emitir la llamada
+  // y manejar el efecto (enviar + asignar) nosotros tras inspeccionar toolCalls.
+});
+
+export interface AgentResult {
+  /** Texto a enviar al cliente (o el mensaje de transferencia si transfirió). */
+  text: string;
+  /** True si el agente decidió transferir con Juan. */
+  shouldTransfer: boolean;
+}
+
+export interface RunAgentArgs {
+  conversationId: string | number;
+  message: string;
+  history: ConversationMessage[];
+}
+
+/**
+ * Genera la respuesta del LLM SIN efectos secundarios (no toca Chatwoot).
+ * Útil para smoke tests. Devuelve el texto y si decidió transferir.
+ */
+export async function generateAgentReply(args: {
+  message: string;
+  history: ConversationMessage[];
+}): Promise<{ text: string; transferred: boolean }> {
+  const messages: ConversationMessage[] = [
+    ...args.history,
+    { role: "user", content: args.message },
+  ];
+
+  const result = await generateText({
     model: openai(MODEL),
-    system,
-    prompt: messageText,
-    tools,
+    system: buildSystemPrompt(),
+    messages,
+    tools: { transfer_to_juan: transferTool },
     stopWhen: stepCountIs(4),
   });
 
-  return { text: text.trim(), shouldTransfer };
+  const transferred = (result.toolCalls ?? []).some(
+    (tc) => tc.toolName === "transfer_to_juan",
+  );
+
+  return {
+    text: transferred ? TRANSFER_MESSAGE : (result.text ?? "").trim(),
+    transferred,
+  };
 }
 
-// Re-export por conveniencia para otros módulos del demo.
-export { EXPEDIENTES };
+/**
+ * Ejecuta el agente para un mensaje entrante, con el historial como contexto.
+ * Si el LLM decide transferir: envía el mensaje con el link de Juan y asigna
+ * la conversación a un humano en Chatwoot.
+ */
+export async function runAgent(args: RunAgentArgs): Promise<AgentResult> {
+  const { conversationId, message, history } = args;
+
+  const { text, transferred } = await generateAgentReply({ message, history });
+
+  if (transferred) {
+    await sendMessage(conversationId, TRANSFER_MESSAGE);
+    await assignToHuman(conversationId);
+    return { text, shouldTransfer: true };
+  }
+
+  return { text, shouldTransfer: false };
+}
