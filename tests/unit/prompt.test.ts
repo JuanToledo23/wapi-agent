@@ -53,6 +53,11 @@ describe("buildSystemPrompt — invariants", () => {
     expect(prompt).toContain("Último grado de estudios");
   });
 
+  // Intake tool
+  it("instructs the agent to call complete_candidate_intake before closing", () => {
+    expect(prompt).toContain("complete_candidate_intake");
+  });
+
   // Closing line
   it("contains the closing handoff to a recruiter", () => {
     expect(prompt).toContain("Un reclutador te va a contactar en breve");
