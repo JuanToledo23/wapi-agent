@@ -5,57 +5,62 @@ describe("buildSystemPrompt — invariants", () => {
   const prompt = buildSystemPrompt();
 
   // Identity
-  it("contains Wapi persona name", () => {
-    expect(prompt).toContain("Eres Wapi");
+  it("is a recruitment assistant", () => {
+    expect(prompt).toContain("asistente de reclutamiento");
   });
-  it("contains wapi.mx domain", () => {
-    expect(prompt).toContain("wapi.mx");
+  it("targets the CDMX financial sector", () => {
+    expect(prompt).toContain("sector financiero");
+    expect(prompt).toContain("CDMX");
   });
 
-  // Prices — must be exactly these, never others
-  it("contains Esencial plan price", () => {
-    expect(prompt).toContain("$1,490");
+  // Vacancies — must be exactly these two
+  it("contains Vacante 1 (Ejecutivo de Cobranza)", () => {
+    expect(prompt).toContain("Ejecutivo de Cobranza");
   });
-  it("contains Crecimiento plan price", () => {
-    expect(prompt).toContain("$2,490");
+  it("contains Vacante 2 (Ejecutivo de Cuentas por Cobrar)", () => {
+    expect(prompt).toContain("Ejecutivo de Cuentas por Cobrar");
   });
-  it("does NOT contain notary prices", () => {
-    expect(prompt).not.toContain("Notaría");
+
+  // Salaries — must be exactly these, never others
+  it("contains Vacante 1 salary", () => {
+    expect(prompt).toContain("$9,800");
+  });
+  it("contains Vacante 2 salary", () => {
+    expect(prompt).toContain("$9,600");
+  });
+
+  // No leftover sales/notary content
+  it("does NOT contain old sales/notary content", () => {
+    expect(prompt).not.toContain("Eres Wapi");
+    expect(prompt).not.toContain("$1,490");
+    expect(prompt).not.toContain("$2,490");
+    expect(prompt).not.toContain("wa.me/527774939562");
     expect(prompt).not.toContain("expediente");
   });
 
-  // Plan limits
-  it("contains 3 usuarios for Esencial", () => {
-    expect(prompt).toContain("3 usuarios");
-  });
-  it("contains 8 usuarios for Crecimiento", () => {
-    expect(prompt).toContain("8 usuarios");
-  });
-
-  // Trial
-  it("contains 14-day trial mention", () => {
-    expect(prompt).toContain("14 días");
-  });
-  it("contains no credit card mention", () => {
-    expect(prompt).toContain("sin tarjeta de crédito");
+  // Flow markers
+  it("describes the strict flow", () => {
+    expect(prompt).toContain("APERTURA");
+    expect(prompt).toContain("PRESENTACIÓN");
+    expect(prompt).toContain("RECOPILACIÓN DE DATOS");
+    expect(prompt).toContain("CIERRE");
   });
 
-  // Transfer
-  it("contains Juan transfer link", () => {
-    expect(prompt).toContain("wa.me/527774939562");
-  });
-  it("contains Juan name", () => {
-    expect(prompt).toContain("Juan");
+  // Data collection fields
+  it("asks for the candidate's data one by one", () => {
+    expect(prompt).toContain("Nombre completo");
+    expect(prompt).toContain("Edad");
+    expect(prompt).toContain("Último grado de estudios");
   });
 
-  // Channels
-  it("mentions WhatsApp Business", () => {
-    expect(prompt).toContain("WhatsApp Business");
+  // Closing line
+  it("contains the closing handoff to a recruiter", () => {
+    expect(prompt).toContain("Un reclutador te va a contactar en breve");
   });
-  it("mentions Instagram", () => {
-    expect(prompt).toContain("Instagram");
-  });
-  it("mentions Messenger", () => {
-    expect(prompt).toContain("Messenger");
+
+  // Tone
+  it("instructs short messages and tuteo", () => {
+    expect(prompt).toContain("Tutea siempre");
+    expect(prompt).toContain("Máximo 3-4 líneas");
   });
 });
