@@ -1,7 +1,7 @@
 {
-  "name": "wapi-agente-demo-reclutamiento",
+  "name": "wapi-agent-bot",
   "version": "1.0.0",
-  "description": "Agente de reclutamiento (demo Wapi) sobre Chatwoot",
+  "description": "Wapi Agent Bot — agente de ventas de wapi.mx sobre Chatwoot",
   "private": true,
   "type": "module",
   "scripts": {

@@ -1,5 +1,5 @@
 /**
- * Servidor Hono — Agente de reclutamiento (demo Wapi) sobre Chatwoot.
+ * Servidor Hono — Wapi Agent Bot (agente de ventas de wapi.mx) sobre Chatwoot.
  *
  * Flujo:
  *   POST /webhook → filtro anti-bucle → ACK 200 → encola por conversación
@@ -112,7 +112,7 @@ export function shouldIgnoreWebhookEvent(payload: unknown): boolean {
   return false;
 }
 
-app.get("/", (c) => c.text("Agente de reclutamiento (demo Wapi) ✅"));
+app.get("/", (c) => c.text("Wapi Agent Bot — wapi.mx ✅"));
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 app.post("/webhook", async (c) => {
@@ -192,6 +192,17 @@ async function processMessage(
     return;
   }
 
+  // Si transfirió con Juan, runAgent ya envió el mensaje con el link y asignó
+  // la conversación. Guardamos el turno y salimos.
+  if (result.shouldTransfer) {
+    appendHistory(
+      conversationId,
+      { role: "user", content: messageText },
+      { role: "assistant", content: result.text },
+    );
+    return;
+  }
+
   // Dividir la respuesta en varios mensajes si contiene |||
   const parts = result.text
     .split("|||")
@@ -202,7 +213,7 @@ async function processMessage(
   // respuesta. Mandamos un mensaje puente y guardamos el turno.
   if (parts.length === 0) {
     const fallback =
-      "Perdona, se me cruzaron los cables 🙈 ¿Me lo repites? Quiero entenderte bien para ayudarte con la vacante.";
+      "Perdona, se me cruzaron los cables 🙈 ¿Me lo repites? Quiero entenderte bien para ayudarte con Wapi.";
     await sendMessage(conversationId, fallback).catch((err) =>
       console.error("[processMessage] fallback falló:", err),
     );
@@ -236,7 +247,7 @@ if (!process.env.VITEST) {
   const port = Number(process.env.PORT ?? 3000);
   serve({ fetch: app.fetch, port }, (info) => {
     console.log(
-      `🚀 Agente de reclutamiento escuchando en http://localhost:${info.port}`,
+      `🚀 Wapi Agent Bot escuchando en http://localhost:${info.port}`,
     );
     console.log(`   Webhook: POST http://localhost:${info.port}/webhook`);
   });

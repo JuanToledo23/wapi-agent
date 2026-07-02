@@ -5,78 +5,84 @@ import { generateAgentReply } from "../../src/agent";
 // Run before every production deploy: npm run test:smoke
 // Requires OPENAI_API_KEY in the environment.
 
-describe.concurrent("Recruitment agent behavior — smoke tests", () => {
-  it("greets and engages on the first message", async () => {
+describe.concurrent("Wapi agent behavior — smoke tests", () => {
+  it("first message returns the correct greeting", async () => {
     const reply = await runAgentGetReply({
       message: "hola",
       history: [],
     });
-    // Should greet warmly and not dump everything at once.
-    expect(reply.length).toBeGreaterThan(0);
-    expect(reply.length).toBeLessThan(600);
+    expect(reply.toLowerCase()).toContain("soy wapi");
+    expect(reply).toContain("¿qué tipo de negocio tienes?");
   }, 15000);
 
-  it("offers the two vacancies when interest is unclear", async () => {
-    const reply = await runAgentGetReply({
-      message: "sí, me interesa",
-      history: [
-        {
-          role: "assistant",
-          content: "¡Hola! Te contacto por las vacantes a las que aplicaste.",
-        },
-      ],
-    });
-    const mentionsAVacancy =
-      reply.toLowerCase().includes("cobranza") ||
-      reply.toLowerCase().includes("cuentas por cobrar") ||
-      reply.toLowerCase().includes("vacante");
-    expect(mentionsAVacancy).toBe(true);
-  }, 15000);
-
-  it("gives the correct salary for Ejecutivo de Cobranza", async () => {
-    const reply = await runAgentGetReply({
-      message: "¿cuánto pagan?",
-      history: [
-        { role: "user", content: "me interesa la de cobranza" },
-        {
-          role: "assistant",
-          content: "Va, te cuento de Ejecutivo de Cobranza.",
-        },
-      ],
-    });
-    expect(reply).toContain("$9,800");
-  }, 15000);
-
-  it("does NOT invent salaries outside the two real ones", async () => {
-    const reply = await runAgentGetReply({
-      message: "¿cuánto pagan?",
-      history: [
-        { role: "user", content: "me interesa cobranza" },
-        { role: "assistant", content: "Te cuento los detalles." },
-      ],
-    });
-    const hasWrongSalary =
-      /\$[0-9,]+/.test(reply) &&
-      !reply.includes("$9,800") &&
-      !reply.includes("$9,600");
-    expect(hasWrongSalary).toBe(false);
-  }, 15000);
-
-  it("stays in scope — defers off-topic questions to the recruiter", async () => {
+  it("stays in topic — refuses off-topic questions", async () => {
     const reply = await runAgentGetReply({
       message: "¿quién ganó el mundial 2022?",
       history: [
-        { role: "user", content: "me interesa la vacante de cobranza" },
-        { role: "assistant", content: "Va, te cuento los detalles." },
+        { role: "user", content: "tengo una clínica" },
+        {
+          role: "assistant",
+          content: "entiendo, cuéntame más sobre tu clínica",
+        },
       ],
     });
+    expect(reply.toLowerCase()).not.toContain("mundial");
     expect(reply.toLowerCase()).not.toContain("qatar");
-    expect(reply.toLowerCase()).not.toContain("argentina");
+    // Should redirect back to Wapi
+    expect(
+      reply.toLowerCase().includes("wapi") ||
+        reply.toLowerCase().includes("solo puedo"),
+    ).toBe(true);
+  }, 15000);
+
+  it("mentions the correct Esencial plan price", async () => {
+    const reply = await runAgentGetReply({
+      message: "¿cuánto cuesta?",
+      history: [
+        { role: "user", content: "tengo un restaurante" },
+        {
+          role: "assistant",
+          content: "cuéntame, ¿cuántas personas atienden mensajes?",
+        },
+        { role: "user", content: "somos 2 personas" },
+      ],
+    });
+    expect(reply).toContain("$1,490");
+  }, 15000);
+
+  it("does NOT invent prices", async () => {
+    const reply = await runAgentGetReply({
+      message: "¿cuánto cuesta?",
+      history: [],
+    });
+    // Should not contain prices other than the two real ones
+    const hasWrongPrice =
+      /\$[0-9,]+/.test(reply) &&
+      !reply.includes("$1,490") &&
+      !reply.includes("$2,490");
+    expect(hasWrongPrice).toBe(false);
+  }, 15000);
+
+  it("handles \"está caro\" without mentioning price first", async () => {
+    const reply = await runAgentGetReply({
+      message: "está caro",
+      history: [
+        { role: "user", content: "tengo un salón de belleza" },
+        { role: "assistant", content: "el plan Esencial cuesta $1,490 al mes" },
+      ],
+    });
+    // Should ask why they feel it's expensive, not just repeat price
+    const asksWhy =
+      reply.toLowerCase().includes("por qué") ||
+      reply.toLowerCase().includes("qué sientes") ||
+      reply.toLowerCase().includes("en relación");
+    expect(asksWhy).toBe(true);
   }, 15000);
 });
 
 // Helper: runs the agent (pure, no Chatwoot side effects) and returns the
-// text reply.
+// text reply. Uses generateAgentReply, which returns the transfer message
+// verbatim if the model decides to transfer.
 async function runAgentGetReply(args: {
   message: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;

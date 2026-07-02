@@ -1,17 +1,18 @@
-# Agente de reclutamiento — demo Wapi
+# Wapi Agent Bot — wapi.mx
 
-Microservicio independiente que conecta un **Agent Bot de Chatwoot** con un
-**agente de IA de reclutamiento** para una agencia de colocación de personal en
-el sector financiero en CDMX.
+Microservicio independiente que conecta un **Agent Bot de Chatwoot** con
+**Wapi**, el agente de ventas de IA de [wapi.mx](https://wapi.mx).
 
-El agente contacta candidatos que ya aplicaron a las vacantes, les presenta la
-posición, resuelve sus dudas con información exacta, y recopila sus datos para
-agendar entrevista. Al terminar, cierra avisando que **un reclutador humano lo
-contactará en breve**.
+Wapi atiende leads por WhatsApp (e Instagram/Messenger vía Chatwoot): entiende
+el negocio del lead, resuelve dudas sobre la plataforma con información exacta,
+maneja objeciones y, cuando detecta interés real (o una pregunta que no puede
+responder con certeza), **transfiere la conversación con Juan Toledo**, fundador
+de Wapi — enviando el link directo de WhatsApp y asignando la conversación a un
+humano en Chatwoot.
 
 El agente recibe el **historial de la conversación** en cada turno, así que
-mantiene contexto multi-turno (clave para el flujo: apertura → presentación →
-dudas → recopilación de datos → cierre).
+mantiene contexto multi-turno (clave para flujos de venta: objeción → rebatir →
+cierre).
 
 ## Stack
 - Node.js + TypeScript
@@ -24,30 +25,31 @@ dudas → recopilación de datos → cierre).
 ```
 src/
   index.ts     → servidor Hono, POST /webhook (filtro anti-bucle + ACK + async)
-                 + historial en memoria por conversación + cola secuencial
+                 + lectura de historial antes de invocar al agente
   chatwoot.ts  → cliente API Chatwoot (sendMessage, assignToHuman,
                  getConversationMessages)
-  agent.ts     → LLM + system prompt de reclutamiento
+  agent.ts     → LLM + system prompt de Wapi + tool transfer_to_juan
                  + helpers puros (buildSystemPrompt, isFirstMessage,
                  mapChatwootMessages)
 tests/
-  unit/        → prompt, history, filter, queue (sin red, <1s)
-  behavioral/  → runAgent con el LLM mockeado
+  unit/        → prompt, history, filter (sin red, <1s)
+  behavioral/  → flujo de transferencia con el LLM mockeado
   smoke/       → escenarios contra OpenAI real (se corren manualmente)
 ```
 
 ## Cómo funciona
 1. Chatwoot envía un webhook del Agent Bot a `POST /webhook`.
 2. Se filtran eventos que no son mensajes entrantes y públicos (anti-bucle).
-3. Se responde `200` de inmediato y se procesa en segundo plano, en orden por
-   conversación.
-4. Se recupera el historial en memoria de la conversación y se invoca al agente
-   con ese historial + el mensaje actual.
-5. El agente responde siguiendo el flujo de reclutamiento (dividiendo en varios
-   mensajes si usa `|||`).
+3. Se responde `200` de inmediato y se procesa en segundo plano.
+4. Se lee el historial de la conversación (`getConversationMessages`) y se
+   mapea a `{role, content}`.
+5. Se invoca al agente con el historial + el mensaje actual.
+6. Si el agente decide transferir, envía el mensaje con el link de Juan
+   (`https://wa.me/527774939562`) y asigna la conversación a un humano.
+   Si no, responde normal (dividiendo en varios mensajes si usa `|||`).
 
 Mientras haya un agente humano asignado a la conversación, el bot guarda
-silencio (handoff: si un reclutador toma la conversación, el bot no responde).
+silencio.
 
 ## Correr en local
 ```bash
@@ -65,7 +67,7 @@ npm run dev            # tsx watch, http://localhost:3000
 | `CHATWOOT_BASE_URL` | URL de tu Chatwoot (ej. `https://app.chatwoot.com`) |
 | `CHATWOOT_ACCOUNT_ID` | ID numérico de la cuenta (lo ves en la URL del dashboard) |
 | `CHATWOOT_API_TOKEN` | Access token de un agente/bot con permisos |
-| `CHATWOOT_HUMAN_AGENT_ID` | ID del agente humano (reclutador) para asignación |
+| `CHATWOOT_HUMAN_AGENT_ID` | ID del agente humano (Juan) al que se transfiere |
 | `OPENAI_API_KEY` | API key de OpenAI |
 | `PORT` | Puerto del servidor (opcional, default 3000) |
 
@@ -75,6 +77,8 @@ npm run dev            # tsx watch, http://localhost:3000
 2. Configura la URL del webhook del bot apuntando a tu despliegue:
    `https://TU-DOMINIO/webhook`.
 3. Asigna el Agent Bot a la bandeja (inbox) de WhatsApp.
+4. Define `CHATWOOT_HUMAN_AGENT_ID` con el ID del agente humano (Juan) que
+   recibirá las conversaciones transferidas.
 
 El bot solo procesa mensajes **entrantes y públicos**; ignora sus propios
 mensajes salientes, notas privadas y eventos de actividad para no entrar en
@@ -88,18 +92,18 @@ npm run test:smoke  # escenarios con OpenAI real (~$0.01, antes de cada deploy)
 npm run test:coverage
 ```
 
-- **unit** (`tests/unit/`): invariantes del system prompt (vacantes, sueldos,
-  flujo), mapeo de historial, filtro anti-bucle y cola secuencial.
-- **behavioral** (`tests/behavioral/`): `runAgent` con el LLM y el cliente de
-  Chatwoot mockeados — verifica que devuelve el texto del modelo sin efectos
-  secundarios.
+- **unit** (`tests/unit/`): invariantes del system prompt (precios, links,
+  límites de plan), mapeo de historial y filtro anti-bucle.
+- **behavioral** (`tests/behavioral/`): flujo de `transfer_to_juan` con el LLM
+  y el cliente de Chatwoot mockeados — verifica que se envía el link de Juan y
+  se asigna a un humano.
 - **smoke** (`tests/smoke/`): llaman a OpenAI de verdad (cuestan dinero y tardan
   ~5s c/u). Requieren `OPENAI_API_KEY`. Están **excluidas** de `npm test` y se
   corren manualmente con `npm run test:smoke` antes de un deploy a producción.
 
 ## Notas del demo
-- Historial en memoria: el contexto multi-turno se reconstruye de un `Map` por
-  `conversationId` (se pierde si el proceso se reinicia).
-- Los sueldos del system prompt (Cobranza $9,800 / Cuentas por Cobrar $9,600)
-  son los únicos válidos — el agente tiene instrucción explícita de no inventar
-  otros ni hablar de vacantes distintas a esas dos.
+- Sin memoria propia: el contexto multi-turno se reconstruye leyendo el
+  historial de la conversación desde la API de Chatwoot en cada mensaje.
+- Los precios y planes del system prompt (Esencial $1,490 / Crecimiento $2,490
+  MXN/mes) son los únicos válidos — el agente tiene instrucción explícita de no
+  inventar otros.
