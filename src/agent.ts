@@ -7,9 +7,7 @@
  */
 
 import { openai } from "@ai-sdk/openai";
-import { generateText, stepCountIs, tool } from "ai";
-import { z } from "zod";
-import { assignToHuman } from "./chatwoot.js";
+import { generateText } from "ai";
 
 /** Modelo de OpenAI. Constante para cambiarlo fácil. */
 const MODEL = "gpt-4o-mini";
@@ -85,12 +83,7 @@ FLUJO (SIGUE ESTE ORDEN ESTRICTAMENTE):
    → Si tiene CV disponible para compartir
 
 5. CIERRE
-   Cuando ya tengas los 5 datos completos (nombre completo, edad, último
-   grado de estudios, colonia/municipio, y si tiene CV), PRIMERO llama al
-   tool complete_candidate_intake. Llámalo UNA sola vez y solo cuando tengas
-   los 5 datos — nunca antes.
-   En cuanto el tool confirme, confirma los datos brevemente y envía
-   EXACTAMENTE este mensaje de cierre:
+   Cuando tengas todos los datos, confírmalos brevemente y di:
    "Perfecto, ya tengo todo. Un reclutador te va a contactar en breve
    para confirmar fecha y hora de tu entrevista y mandarte la ubicación exacta."
 
@@ -143,37 +136,9 @@ export function mapChatwootMessages(
   return mapped.slice(-20);
 }
 
-/**
- * Construye el tool complete_candidate_intake.
- *
- * El LLM lo invoca cuando ya recopiló los 5 datos del candidato. Su `execute`
- * dispara el efecto (asignar la conversación a un reclutador humano) y devuelve
- * una confirmación al modelo para que genere el mensaje de cierre.
- *
- * El efecto se inyecta como callback (`onIntakeComplete`) para que la función
- * pura `generateAgentReply` siga sin tocar Chatwoot en los smoke tests.
- */
-function buildIntakeTool(onIntakeComplete: () => Promise<void>) {
-  return tool({
-    description:
-      "Use this tool ONCE, only after you have collected ALL FIVE candidate " +
-      "data points (full name, age, last level of studies, neighborhood/" +
-      "municipality, and whether they have a CV). Calling it assigns the " +
-      "conversation to a human recruiter. Call it BEFORE sending the closing " +
-      "message. Never call it before having all five.",
-    inputSchema: z.object({}),
-    execute: async () => {
-      await onIntakeComplete();
-      return { assigned: true };
-    },
-  });
-}
-
 export interface AgentResult {
   /** Texto a enviar al candidato. */
   text: string;
-  /** True si el agente completó la recopilación y asignó a un reclutador. */
-  intakeCompleted: boolean;
 }
 
 export interface RunAgentArgs {
@@ -183,62 +148,34 @@ export interface RunAgentArgs {
 }
 
 /**
- * Genera la respuesta del LLM. El efecto de asignar a un humano se inyecta vía
- * `onIntakeComplete`; si no se pasa, es un no-op (función pura para smoke tests).
- * Devuelve el texto generado y si el tool de intake se disparó.
+ * Genera la respuesta del LLM SIN efectos secundarios (no toca Chatwoot).
+ * Útil para smoke tests. Devuelve el texto generado.
  */
 export async function generateAgentReply(args: {
   message: string;
   history: ConversationMessage[];
-  onIntakeComplete?: () => Promise<void>;
-}): Promise<{ text: string; intakeCompleted: boolean }> {
+}): Promise<{ text: string }> {
   const messages: ConversationMessage[] = [
     ...args.history,
     { role: "user", content: args.message },
   ];
 
-  const onIntakeComplete = args.onIntakeComplete ?? (async () => {});
-
   const result = await generateText({
     model: openai(MODEL),
     system: buildSystemPrompt(),
     messages,
-    tools: { complete_candidate_intake: buildIntakeTool(onIntakeComplete) },
-    // Permitimos pasos extra: el modelo llama al tool, recibe la confirmación
-    // y luego genera el mensaje de cierre en el siguiente paso.
-    stopWhen: stepCountIs(4),
   });
 
-  const intakeCompleted = (result.toolCalls ?? []).some(
-    (tc) => tc.toolName === "complete_candidate_intake",
-  );
-
-  return { text: (result.text ?? "").trim(), intakeCompleted };
+  return { text: (result.text ?? "").trim() };
 }
 
 /**
  * Ejecuta el agente para un mensaje entrante, con el historial como contexto.
- * Si el modelo decide que la recopilación está completa, el tool
- * complete_candidate_intake asigna la conversación a un reclutador humano.
- * Devuelve el texto a enviar al candidato; el envío vía Chatwoot lo hace quien
- * llama (processMessage en index.ts).
+ * Devuelve el texto a enviar al candidato. El envío vía Chatwoot lo hace
+ * quien llama (processMessage en index.ts).
  */
 export async function runAgent(args: RunAgentArgs): Promise<AgentResult> {
-  const { conversationId, message, history } = args;
-
-  const { text, intakeCompleted } = await generateAgentReply({
-    message,
-    history,
-    onIntakeComplete: async () => {
-      try {
-        await assignToHuman(conversationId);
-      } catch (err) {
-        // El candidato igual recibe el mensaje de cierre; si la asignación en
-        // Chatwoot falla, lo registramos para revisarlo y seguimos.
-        console.error("[runAgent] assignToHuman falló en intake:", err);
-      }
-    },
-  });
-
-  return { text, intakeCompleted };
+  const { message, history } = args;
+  const { text } = await generateAgentReply({ message, history });
+  return { text };
 }
